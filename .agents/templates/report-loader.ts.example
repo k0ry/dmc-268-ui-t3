@@ -1,0 +1,31 @@
+// Учебный модуль. После согласования DTO скопируйте как report-loader.ts.
+// Требует Zod; это не контракт текущего backend.
+import { z } from 'zod'
+
+export const Report = z.object({
+  run_id: z.string().min(1),
+  status: z.enum(['complete', 'partial', 'failed']),
+}).strict()
+export type Report = z.infer<typeof Report>
+
+export function createReportLoader(
+  fetchReport: (id: string) => Promise<unknown>,
+  show: (report: Report) => void,
+  showError: (error: unknown) => void,
+) {
+  let generation = 0
+  return {
+    async load(id: string) {
+      const request = ++generation
+      try {
+        const report = Report.parse(await fetchReport(id))
+        if (report.run_id !== id) throw new Error('Unexpected run_id')
+        if (request === generation) show(report)
+      } catch (error) {
+        if (request === generation) showError(error)
+      }
+    },
+    // В React вызывать в cleanup; реальный fetch дополнительно отменять.
+    cancel() { generation += 1 },
+  }
+}

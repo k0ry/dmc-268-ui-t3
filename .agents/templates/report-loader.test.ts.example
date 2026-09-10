@@ -1,0 +1,51 @@
+// После настройки Vitest/Zod скопируйте рядом с report-loader.ts.
+import { describe, expect, it, vi } from 'vitest'
+import { createReportLoader, Report } from './report-loader'
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+
+describe('report boundary and request ordering', () => {
+  it('rejects malformed API response', () => {
+    expect(Report.safeParse({ run_id: 12, status: 'ok' }).success).toBe(false)
+  })
+  it('keeps B when A finishes later', async () => {
+    const a = deferred<unknown>(), b = deferred<unknown>()
+    const show = vi.fn(), error = vi.fn()
+    const loader = createReportLoader(id => id === 'A' ? a.promise : b.promise, show, error)
+    const first = loader.load('A'), second = loader.load('B')
+    b.resolve({ run_id: 'B', status: 'complete' }); await second
+    a.resolve({ run_id: 'A', status: 'complete' }); await first
+    expect(show.mock.calls).toEqual([[{ run_id: 'B', status: 'complete' }]])
+    expect(error).not.toHaveBeenCalled()
+  })
+  it('keeps B error when A succeeds later', async () => {
+    const a = deferred<unknown>(), b = deferred<unknown>()
+    const show = vi.fn(), error = vi.fn()
+    const loader = createReportLoader(id => id === 'A' ? a.promise : b.promise, show, error)
+    const first = loader.load('A'), second = loader.load('B')
+    b.reject(new Error('B unavailable')); await second
+    a.resolve({ run_id: 'A', status: 'complete' }); await first
+    expect(show).not.toHaveBeenCalled()
+    expect(error).toHaveBeenCalledOnce()
+  })
+  it('ignores completion after cleanup', async () => {
+    const response = deferred<unknown>(), show = vi.fn(), error = vi.fn()
+    const loader = createReportLoader(() => response.promise, show, error)
+    const pending = loader.load('A'); loader.cancel()
+    response.resolve({ run_id: 'A', status: 'complete' }); await pending
+    expect(show).not.toHaveBeenCalled()
+    expect(error).not.toHaveBeenCalled()
+  })
+  it('rejects a different run from the server', async () => {
+    const show = vi.fn(), error = vi.fn()
+    const loader = createReportLoader(async () => ({ run_id: 'B', status: 'complete' }), show, error)
+    await loader.load('A')
+    expect(show).not.toHaveBeenCalled()
+    expect(error).toHaveBeenCalledOnce()
+  })
+})

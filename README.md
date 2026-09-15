@@ -1,10 +1,12 @@
-# DMC-268 UI (Team 3)
+# DMC-268 UI (команда 3)
 
-Vite + React + TypeScript frontend for DMC-268 Team 3.
+Frontend команды 3 на Vite, React и TypeScript.
 
-## Setup & Run
+## Установка и запуск
 
 ```bash
 npm install
 npm run dev
 ```
+
+Правила, скиллы и шаблоны разработки команды: [.agents/README.md](.agents/README.md).

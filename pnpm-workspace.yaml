@@ -1,0 +1,5 @@
+# "packages" keeps older global pnpm (9.x) happy; allowBuilds is pnpm 10+'s opt-in for install scripts.
+packages:
+  - '.'
+allowBuilds:
+  esbuild: true

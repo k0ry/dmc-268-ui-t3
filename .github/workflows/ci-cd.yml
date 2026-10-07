@@ -1,0 +1,160 @@
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  checks:
+    name: Types, lint, format, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      # pnpm version comes from package.json "packageManager".
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check-types
+      - run: pnpm lint
+      - run: pnpm format:check
+      - run: pnpm build
+
+  image:
+    name: Build and push image
+    needs: checks
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.tag.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: tag
+        run: echo "image=${IMAGE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tag.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to production
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: http://${{ vars.VPS_DMC268_IP_T3 }}/
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DEPLOY_HOST: ${{ vars.VPS_DMC268_IP_T3 }}
+      APP_DIR: /opt/dmc268
+      IMAGE_REF: ${{ needs.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          install -m 600 .github/ssh/known_hosts ~/.ssh/known_hosts
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          cat > ~/.ssh/config <<EOF
+          Host deploy-target
+            HostName ${DEPLOY_HOST}
+            User deploy
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            BatchMode yes
+          EOF
+
+      # Newer than this commit's tip of main? Then a later merge already deployed
+      # (or will deploy) a newer version; applying this one would roll it back.
+      - name: Skip if a newer commit exists on main
+        id: fresh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tip="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"
+          if [ "$tip" != "$GITHUB_SHA" ]; then
+            echo "::notice::${GITHUB_SHA} is no longer the tip of main (${tip}); skipping this deploy."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Pulled before staging, so Terraform finds the image locally.
+      - name: Pull image on the server
+        if: steps.fresh.outputs.stale != 'true'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | ssh deploy-target "set -e
+            export DOCKER_CONFIG=\$(mktemp -d)
+            trap 'rm -rf \"\$DOCKER_CONFIG\"' EXIT
+            docker login ghcr.io -u '$GHCR_USER' --password-stdin >/dev/null
+            docker pull -q '$IMAGE_REF'"
+
+      # The Terraform config and backend secrets are owned by dmc-268-api-t3's deploy.
+      # This job stages only the web image; the server-side deploy.sh (installed by the
+      # backend deploy) promotes it under a lock and fails fast if there is no backend yet.
+      - name: Stage web image and terraform apply
+        if: steps.fresh.outputs.stale != 'true'
+        run: |
+          set -euo pipefail
+          ssh deploy-target "test -x $APP_DIR/infra/deploy.sh" || {
+            echo "::error::Backend infra is not deployed on the server yet. Deploy dmc-268-api-t3 (push to its main) first."
+            exit 1
+          }
+          STAGE="$APP_DIR/incoming/frontend-$GITHUB_RUN_ID"
+          ssh deploy-target "install -d -m 700 $APP_DIR/incoming && rm -rf $STAGE && install -d -m 700 $STAGE"
+          jq -n --arg web_image "$IMAGE_REF" '{web_image: $web_image}' \
+            | ssh deploy-target "umask 077 && cat > $STAGE/web.auto.tfvars.json"
+          ssh deploy-target "$APP_DIR/infra/deploy.sh $STAGE"
+
+      - name: Smoke test
+        if: steps.fresh.outputs.stale != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 20 --retry-delay 3 --retry-all-errors "http://${DEPLOY_HOST}/" | grep -q '<title>DMC-268 UI (Team 3)</title>'
+          curl -fsS "http://${DEPLOY_HOST}/some/client/route" | grep -q '<title>DMC-268 UI (Team 3)</title>'
+          curl -fsS "http://${DEPLOY_HOST}/api/healthcheck"
+
+      - name: Prune old images
+        if: steps.fresh.outputs.stale != 'true'
+        continue-on-error: true
+        # Only prune what the pipelines pushed; Docker Hub images (terraform, caddy, ...) stay cached.
+        run: ssh deploy-target "docker images --format '{{.Repository}}:{{.Tag}} {{.CreatedSince}}' | grep '^ghcr.io/' | grep -E 'weeks|month|year' | cut -d' ' -f1 | xargs -r docker rmi" || true
